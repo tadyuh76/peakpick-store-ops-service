@@ -55,7 +55,7 @@ async def mark_preparing(
             EventType.ORDER_PREPARING,
             aggregate_id=order_id,
             source=settings.service_name,
-            payload=item,
+            payload=dict(item),
             correlation_id=str(item["correlation_id"]),
         )
     )
@@ -75,7 +75,7 @@ async def mark_ready(
             EventType.ORDER_PLACED_IN_SLOT,
             aggregate_id=order_id,
             source=settings.service_name,
-            payload=item,
+            payload=dict(item),
             correlation_id=str(item["correlation_id"]),
         )
     )
@@ -87,7 +87,7 @@ async def mark_ready(
             EventType.ORDER_READY,
             aggregate_id=order_id,
             source=settings.service_name,
-            payload=item,
+            payload=dict(item),
             correlation_id=str(item["correlation_id"]),
         )
     )
@@ -123,7 +123,7 @@ async def verify_pickup(
             EventType.ORDER_PICKED_UP,
             aggregate_id=order_id,
             source=settings.service_name,
-            payload=item,
+            payload=dict(item),
             correlation_id=str(item["correlation_id"]),
         )
     )
