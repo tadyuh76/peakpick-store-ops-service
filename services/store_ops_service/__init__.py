@@ -1,0 +1,2 @@
+"""Store operations service."""
+
