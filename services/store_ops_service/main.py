@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -16,6 +17,13 @@ from shared.settings import get_settings
 settings = get_settings("store-ops-service")
 logger = configure_logging(settings.service_name)
 board: dict[str, dict[str, object]] = {}
+BOARD_EVENT_TYPES = (
+    EventType.PICKUP_SLOT_RESERVED,
+    EventType.ORDER_PREPARING,
+    EventType.ORDER_PLACED_IN_SLOT,
+    EventType.ORDER_READY,
+    EventType.ORDER_PICKED_UP,
+)
 
 
 class PickupRequest(BaseModel):
@@ -27,19 +35,107 @@ def pickup_token(order_id: str) -> str:
     return f"PK-{digest}"
 
 
+def _database_enabled() -> bool:
+    return bool(settings.database_url)
+
+
+def _timestamp(value: object) -> str:
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def _apply_board_event(
+    state: dict[str, dict[str, object]],
+    event_type: str,
+    aggregate_id: str,
+    correlation_id: str,
+    payload: dict[str, object],
+    occurred_at: object,
+) -> None:
+    status_by_event = {
+        EventType.PICKUP_SLOT_RESERVED: "SlotAssigned",
+        EventType.ORDER_PREPARING: "Preparing",
+        EventType.ORDER_PLACED_IN_SLOT: "PlacedInSlot",
+        EventType.ORDER_READY: "ReadyForPickup",
+        EventType.ORDER_PICKED_UP: "Completed",
+    }
+    status = status_by_event.get(event_type)
+    if not status:
+        return
+
+    existing = state.get(aggregate_id, {})
+    state[aggregate_id] = {
+        "order_id": aggregate_id,
+        "slot_id": payload.get("slot_id", existing.get("slot_id", "")),
+        "pickup_window": payload.get("pickup_window", existing.get("pickup_window", "")),
+        "status": status,
+        "token": payload.get("token", existing.get("token")),
+        "correlation_id": str(correlation_id or payload.get("correlation_id", existing.get("correlation_id", ""))),
+        "updated_at": _timestamp(occurred_at),
+    }
+
+
+async def _list_board() -> list[dict[str, object]]:
+    if not _database_enabled():
+        return list(board.values())
+    hydrated = await asyncio.to_thread(_list_board_from_event_log_sync)
+    board.clear()
+    board.update({str(item["order_id"]): item for item in hydrated})
+    return hydrated
+
+
+def _list_board_from_event_log_sync() -> list[dict[str, object]]:
+    import psycopg
+    from psycopg.rows import dict_row
+
+    with psycopg.connect(settings.database_url, row_factory=dict_row) as conn:
+        rows = conn.execute(
+            """
+            SELECT event_type, aggregate_id, correlation_id, payload, occurred_at
+            FROM event_log
+            WHERE event_type = ANY(%s)
+            ORDER BY occurred_at ASC, created_at ASC
+            """,
+            ([str(event_type) for event_type in BOARD_EVENT_TYPES],),
+        ).fetchall()
+
+    state: dict[str, dict[str, object]] = {}
+    for row in rows:
+        payload = row["payload"]
+        if isinstance(payload, dict):
+            _apply_board_event(
+                state,
+                str(row["event_type"]),
+                str(row["aggregate_id"]),
+                str(row["correlation_id"]),
+                payload,
+                row["occurred_at"],
+            )
+    return list(state.values())
+
+
+async def _require_board_item(
+    order_id: str,
+    state: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    if order_id not in state and _database_enabled():
+        await _list_board()
+    if order_id not in state:
+        raise HTTPException(status_code=404, detail="Order is not on the staff board")
+    return state[order_id]
+
+
 async def handle_pickup_slot_reserved(
     event: EventEnvelope,
     state: dict[str, dict[str, object]] = board,
 ) -> None:
-    state[event.aggregate_id] = {
-        "order_id": event.aggregate_id,
-        "slot_id": event.payload["slot_id"],
-        "pickup_window": event.payload["pickup_window"],
-        "status": "SlotAssigned",
-        "token": None,
-        "correlation_id": event.correlation_id,
-        "updated_at": datetime.now(UTC).isoformat(),
-    }
+    _apply_board_event(
+        state,
+        str(event.event_type),
+        event.aggregate_id,
+        event.correlation_id,
+        event.payload,
+        datetime.now(UTC),
+    )
 
 
 async def mark_preparing(
@@ -47,7 +143,7 @@ async def mark_preparing(
     event_bus: InMemoryEventBus | RabbitMQEventBus,
     state: dict[str, dict[str, object]] = board,
 ) -> dict[str, object]:
-    item = _require_board_item(order_id, state)
+    item = await _require_board_item(order_id, state)
     item["status"] = "Preparing"
     item["updated_at"] = datetime.now(UTC).isoformat()
     await event_bus.publish(
@@ -67,7 +163,7 @@ async def mark_ready(
     event_bus: InMemoryEventBus | RabbitMQEventBus,
     state: dict[str, dict[str, object]] = board,
 ) -> dict[str, object]:
-    item = _require_board_item(order_id, state)
+    item = await _require_board_item(order_id, state)
     item["status"] = "PlacedInSlot"
     item["updated_at"] = datetime.now(UTC).isoformat()
     await event_bus.publish(
@@ -113,7 +209,7 @@ async def verify_pickup(
     event_bus: InMemoryEventBus | RabbitMQEventBus,
     state: dict[str, dict[str, object]] = board,
 ) -> dict[str, object]:
-    item = _require_board_item(order_id, state)
+    item = await _require_board_item(order_id, state)
     if item["token"] != token:
         raise HTTPException(status_code=400, detail="Invalid pickup token")
     item["status"] = "Completed"
@@ -128,13 +224,6 @@ async def verify_pickup(
         )
     )
     return item
-
-
-def _require_board_item(order_id: str, state: dict[str, dict[str, object]]) -> dict[str, object]:
-    if order_id not in state:
-        raise HTTPException(status_code=404, detail="Order is not on the staff board")
-    return state[order_id]
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -172,7 +261,7 @@ async def health(request: Request) -> dict[str, object]:
 
 @app.get("/board")
 async def get_board() -> list[dict[str, object]]:
-    return list(board.values())
+    return await _list_board()
 
 
 @app.post("/orders/{order_id}/preparing")
