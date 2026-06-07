@@ -35,6 +35,16 @@ def pickup_token(order_id: str) -> str:
     return f"PK-{digest}"
 
 
+def _require_status(item: dict[str, object], allowed: set[str], action: str) -> None:
+    current = str(item["status"])
+    if current not in allowed:
+        allowed_list = ", ".join(sorted(allowed))
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot {action} order from status {current}. Expected: {allowed_list}",
+        )
+
+
 def _database_enabled() -> bool:
     return bool(settings.database_url)
 
@@ -144,6 +154,7 @@ async def mark_preparing(
     state: dict[str, dict[str, object]] = board,
 ) -> dict[str, object]:
     item = await _require_board_item(order_id, state)
+    _require_status(item, {"SlotAssigned"}, "mark preparing")
     item["status"] = "Preparing"
     item["updated_at"] = datetime.now(UTC).isoformat()
     await event_bus.publish(
@@ -164,6 +175,7 @@ async def mark_ready(
     state: dict[str, dict[str, object]] = board,
 ) -> dict[str, object]:
     item = await _require_board_item(order_id, state)
+    _require_status(item, {"Preparing"}, "mark ready")
     item["status"] = "PlacedInSlot"
     item["updated_at"] = datetime.now(UTC).isoformat()
     await event_bus.publish(
@@ -210,10 +222,16 @@ async def verify_pickup(
     state: dict[str, dict[str, object]] = board,
 ) -> dict[str, object]:
     item = await _require_board_item(order_id, state)
-    if item["token"] != token:
+    _require_status(item, {"ReadyForPickup"}, "verify pickup")
+    expected_token = str(item["token"]).strip().upper()
+    provided_token = token.strip().upper()
+    if expected_token != provided_token:
         raise HTTPException(status_code=400, detail="Invalid pickup token")
+    now = datetime.now(UTC).isoformat()
     item["status"] = "Completed"
-    item["updated_at"] = datetime.now(UTC).isoformat()
+    item["verified_at"] = now
+    item["picked_up_at"] = now
+    item["updated_at"] = now
     await event_bus.publish(
         new_event(
             EventType.ORDER_PICKED_UP,
@@ -260,8 +278,16 @@ async def health(request: Request) -> dict[str, object]:
 
 
 @app.get("/board")
-async def get_board() -> list[dict[str, object]]:
-    return await _list_board()
+async def get_board(status: str | None = None) -> list[dict[str, object]]:
+    items = await _list_board()
+    if status:
+        items = [item for item in items if item["status"] == status]
+    return sorted(items, key=lambda item: (str(item["pickup_window"]), str(item["slot_id"])))
+
+
+@app.get("/board/{order_id}")
+async def get_board_item(order_id: str) -> dict[str, object]:
+    return await _require_board_item(order_id, board)
 
 
 @app.post("/orders/{order_id}/preparing")
