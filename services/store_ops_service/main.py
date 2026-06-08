@@ -10,8 +10,9 @@ from pydantic import BaseModel
 
 from shared.event_bus import InMemoryEventBus, RabbitMQEventBus, build_event_bus
 from shared.events import EventEnvelope, EventType, new_event
-from shared.logging import configure_logging, log_event
+from shared.logging import configure_logging, install_api_logging, log_event
 from shared.settings import get_settings
+from shared.tenancy import DEFAULT_STORE_ID, store_id_from_request
 
 
 settings = get_settings("store-ops-service")
@@ -75,6 +76,7 @@ def _apply_board_event(
     existing = state.get(aggregate_id, {})
     state[aggregate_id] = {
         "order_id": aggregate_id,
+        "store_id": payload.get("store_id", existing.get("store_id", DEFAULT_STORE_ID)),
         "slot_id": payload.get("slot_id", existing.get("slot_id", "")),
         "pickup_window": payload.get("pickup_window", existing.get("pickup_window", "")),
         "status": status,
@@ -84,29 +86,42 @@ def _apply_board_event(
     }
 
 
-async def _list_board() -> list[dict[str, object]]:
+async def _list_board(store_id: str | None = None) -> list[dict[str, object]]:
     if not _database_enabled():
-        return list(board.values())
-    hydrated = await asyncio.to_thread(_list_board_from_event_log_sync)
+        items = list(board.values())
+        return [item for item in items if item.get("store_id", DEFAULT_STORE_ID) == store_id] if store_id else items
+    hydrated = await asyncio.to_thread(_list_board_from_event_log_sync, store_id)
     board.clear()
     board.update({str(item["order_id"]): item for item in hydrated})
     return hydrated
 
 
-def _list_board_from_event_log_sync() -> list[dict[str, object]]:
+def _list_board_from_event_log_sync(store_id: str | None = None) -> list[dict[str, object]]:
     import psycopg
     from psycopg.rows import dict_row
 
     with psycopg.connect(settings.database_url, row_factory=dict_row) as conn:
-        rows = conn.execute(
-            """
-            SELECT event_type, aggregate_id, correlation_id, payload, occurred_at
-            FROM event_log
-            WHERE event_type = ANY(%s)
-            ORDER BY occurred_at ASC, created_at ASC
-            """,
-            ([str(event_type) for event_type in BOARD_EVENT_TYPES],),
-        ).fetchall()
+        if store_id:
+            rows = conn.execute(
+                """
+                SELECT event_type, aggregate_id, correlation_id, payload, occurred_at
+                FROM event_log
+                WHERE store_id = %s
+                  AND event_type = ANY(%s)
+                ORDER BY occurred_at ASC, created_at ASC
+                """,
+                (store_id, [str(event_type) for event_type in BOARD_EVENT_TYPES]),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT event_type, aggregate_id, correlation_id, payload, occurred_at
+                FROM event_log
+                WHERE event_type = ANY(%s)
+                ORDER BY occurred_at ASC, created_at ASC
+                """,
+                ([str(event_type) for event_type in BOARD_EVENT_TYPES],),
+            ).fetchall()
 
     state: dict[str, dict[str, object]] = {}
     for row in rows:
@@ -266,6 +281,7 @@ app = FastAPI(
     description="Staff board, preparation status, and pickup verification.",
     lifespan=lifespan,
 )
+install_api_logging(app, logger, settings.service_name)
 
 
 @app.get("/health")
@@ -278,16 +294,20 @@ async def health(request: Request) -> dict[str, object]:
 
 
 @app.get("/board")
-async def get_board(status: str | None = None) -> list[dict[str, object]]:
-    items = await _list_board()
+async def get_board(request: Request, status: str | None = None) -> list[dict[str, object]]:
+    items = await _list_board(store_id_from_request(request))
     if status:
         items = [item for item in items if item["status"] == status]
     return sorted(items, key=lambda item: (str(item["pickup_window"]), str(item["slot_id"])))
 
 
 @app.get("/board/{order_id}")
-async def get_board_item(order_id: str) -> dict[str, object]:
-    return await _require_board_item(order_id, board)
+async def get_board_item(order_id: str, request: Request) -> dict[str, object]:
+    item = await _require_board_item(order_id, board)
+    request_store_id = store_id_from_request(request)
+    if item.get("store_id", DEFAULT_STORE_ID) != request_store_id:
+        raise HTTPException(status_code=404, detail="Order is not on this store board")
+    return item
 
 
 @app.post("/orders/{order_id}/preparing")
