@@ -221,6 +221,7 @@ async def mark_ready(
             source=settings.service_name,
             payload={
                 "order_id": order_id,
+                "store_id": item.get("store_id", DEFAULT_STORE_ID),
                 "channel": "demo",
                 "message": f"Order {order_id} is ready at slot {item['slot_id']}. Token: {item['token']}",
             },
