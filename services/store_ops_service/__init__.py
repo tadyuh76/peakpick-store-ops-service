@@ -1,2 +1,1 @@
-"""Store operations service."""
-
+"""Dịch vụ Store Operations."""
